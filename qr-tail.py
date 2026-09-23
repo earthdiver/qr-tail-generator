@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate QR Model 2 symbols containing byte segments after four-bit terminators."""
+"""Generate QR Model 2 symbols with byte or alphanumeric segments after terminators."""
 import argparse
 import ctypes as c
 from pathlib import Path
@@ -31,7 +31,8 @@ def library():
     return lib
 
 
-def generate(text, tails, ecc='M', version=0, mask=-1, eci=None, replacement=None, diagnostics=None):
+def generate(text, tails, ecc='M', version=0, mask=-1, eci=None, replacement=None, diagnostics=None,
+             *, tail_mode='byte'):
     if not tails or any(not item for item in [text, *tails]):
         raise ValueError('The visible data and each additional group must be nonempty.')
     items = [text, *tails]
@@ -39,14 +40,24 @@ def generate(text, tails, ecc='M', version=0, mask=-1, eci=None, replacement=Non
         raise ValueError('Replacement data must be nonempty.')
     if ecc not in ('L', 'M', 'Q', 'H') or not 0 <= version <= 40 or not -1 <= mask <= 7:
         raise ValueError('Invalid ECC level, version, or mask.')
+    if tail_mode not in ('byte', 'alphanumeric'):
+        raise ValueError('Invalid additional segment mode.')
     if eci is None:
         eci = all(isinstance(item, str) for item in items + ([] if replacement is None else [replacement]))
     payloads = [item.encode('utf-8') if isinstance(item, str) else bytes(item) for item in items]
     target = None if replacement is None else (replacement.encode('utf-8') if isinstance(replacement, str) else bytes(replacement))
     body_length = max(len(payloads[0]), len(target) if target is not None else 0)
     padding_bits = (body_length - len(payloads[0])) * 8
-    if body_length + sum(map(len, payloads[1:])) > 2953:
+    alphanumeric = tail_mode == 'alphanumeric'
+    if alphanumeric and any(byte not in b'0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:'
+                            for payload in payloads[1:] for byte in payload):
+        raise ValueError('Alphanumeric additional groups must use QR alphanumeric characters.')
+    def tail_data_bits(length):
+        return (length // 2) * 11 + (length % 2) * 6 if alphanumeric else length * 8
+    if not alphanumeric and body_length + sum(map(len, payloads[1:])) > 2953:
         raise ValueError('Input exceeds the maximum QR byte capacity; shorten the input.')
+    if alphanumeric and body_length * 8 + sum(tail_data_bits(len(data)) for data in payloads[1:]) > 2956 * 8:
+        raise ValueError('Input exceeds the maximum QR data capacity; shorten the input.')
     lib = library()
     inp = lib.QRinput_new2(version, 'LMQH'.index(ecc))
     if not inp:
@@ -67,8 +78,9 @@ def generate(text, tails, ecc='M', version=0, mask=-1, eci=None, replacement=Non
                         if lib.QRinput_append(handle, -1, 0, None) < 0:
                             raise ValueError('Could not append post-terminator zero padding.')
                 buffer = c.create_string_buffer(data)
-                if lib.QRinput_append(handle, 2, len(data), buffer) < 0:
-                    raise ValueError('Could not append byte segment.')
+                mode = 1 if index and alphanumeric else 2  # QR_MODE_AN / QR_MODE_8
+                if lib.QRinput_append(handle, mode, len(data), buffer) < 0:
+                    raise ValueError('Could not append data segment.')
         append_segments(inp, payloads)
         if target is None:
             code = lib.QRcode_encodeMask(inp, mask)
@@ -88,13 +100,14 @@ def generate(text, tails, ecc='M', version=0, mask=-1, eci=None, replacement=Non
         qr = code.contents
         rows = [[qr.data[y * qr.width + x] & 1 for x in range(qr.width)] for y in range(qr.width)]
         count_bits = 8 if qr.version < 10 else 16
+        tail_count_bits = (9 if qr.version < 10 else 11 if qr.version < 27 else 13) if alphanumeric else count_bits
         position = (12 if eci else 0) + 4 + count_bits + len(payloads[0]) * 8
         offsets = []
         for index, payload in enumerate(payloads[1:]):
             offsets.append(position)
             if index == 0:
                 position += padding_bits
-            position += 4 + 4 + count_bits + len(payload) * 8
+            position += 4 + 4 + tail_count_bits + tail_data_bits(len(payload))
         if target is not None and diagnostics is not None:
             diagnostics['padding_bits'] = padding_bits
             diagnostics['replacement_padding_bits'] = (body_length - len(target)) * 8
@@ -163,6 +176,8 @@ def main():
     hidden.add_argument('--tail-hex', type=parse_hex, action='append', help='Additional binary group as HEX; repeat for multiple terminators.')
     hidden.add_argument('--tail', action='append', help='Additional UTF-8 group; repeat for multiple terminators.')
     hidden.add_argument('--tail-file', type=Path, action='append', help='Read additional UTF-8 group from a file; repeat as needed.')
+    parser.add_argument('--tail-mode', choices=['byte', 'alphanumeric'], default='byte',
+                        help='Encoding mode for all additional groups, independent of the body (default: byte).')
     parser.add_argument('-o', '--output', required=True, type=Path, help='Output .png, .svg, or matrix .txt.')
     parser.add_argument('--ecc', choices=list('LMQH'), default='M')
     parser.add_argument('--version', type=int, choices=range(0, 41), default=0, metavar='0..40', help='Minimum version; 0 selects automatically.')
@@ -187,7 +202,8 @@ def main():
                       read(args.ecc_text_file) if args.ecc_text_file is not None else None)
         diagnostics = {}
         rows, version, offsets = generate(text, tails, args.ecc, args.version, args.mask,
-                                          False if args.no_eci else None, replacement, diagnostics)
+                                          False if args.no_eci else None, replacement, diagnostics,
+                                          tail_mode=args.tail_mode)
         data = output_bytes(rows, args.output.suffix.lower(), args.scale, args.margin)
         with args.output.open('wb' if args.force else 'xb') as stream:
             stream.write(data)
