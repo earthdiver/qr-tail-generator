@@ -1,0 +1,6 @@
+/build/
+/vendor/
+__pycache__/
+.venv/
+example.png
+example.txt
