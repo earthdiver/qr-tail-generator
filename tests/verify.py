@@ -170,6 +170,18 @@ with tempfile.TemporaryDirectory() as temp:
             remaining.append(parity // 2 - changes)
             position += length
         assert min(remaining) == stats['min_remaining'] >= 0
+        # Enforce the independently measured boundary; accepted output is identical.
+        checked = qr.generate(body, tails, ecc, version, mask, eci, target,
+                              min_rs_margin=min(remaining))
+        assert checked == (rows, actual_version, offsets)
+        if min(remaining) < 15:
+            try:
+                qr.generate(body, tails, ecc, version, mask, eci, target,
+                            min_rs_margin=min(remaining) + 1)
+            except ValueError as error:
+                assert 'below required minimum' in str(error)
+            else:
+                raise AssertionError('Insufficient RS margin accepted')
         return actual_version, stats
 
     for ecc in 'LMQH':
@@ -213,6 +225,39 @@ with tempfile.TemporaryDirectory() as temp:
     # V5-Q has four blocks: total errors are small, but block 1 exceeds its limit.
     rejected(bytes(40), bytes([0x10]) * 10 + bytes(30), [b'Z'], 'Q', 5, 1, 10, 9)
     rejected(bytes(40), bytes(14) + bytes([0x10]) * 10 + bytes(16), [b'Z'], 'Q', 5, 2, 10, 9)
+    # V5-Q block 2 alone consumes eight of its nine correction codewords.
+    try:
+        qr.generate(bytes(40), [b'Z'], 'Q', 5, eci=False,
+                    replacement=bytes(14) + bytes([0x10]) * 8 + bytes(18), min_rs_margin=2)
+    except ValueError as error:
+        assert str(error) == ('RS block 2: remaining correction capacity 1 is below required minimum 2 '
+                              'codewords (8 differing data codewords, correction limit 9).')
+    else:
+        raise AssertionError('Single-block margin failure accepted')
+    # No replacement consumes no correction capacity; enforce the same boundary.
+    for ecc, capacity in [('L', 3), ('M', 5), ('Q', 6), ('H', 8)]:
+        for mask in [-1, *range(8)]:
+            stats = {}
+            normal = qr.generate('A', ['Z'], ecc, mask=mask, eci=False)
+            checked = qr.generate('A', ['Z'], ecc, mask=mask, eci=False,
+                                  diagnostics=stats, min_rs_margin=capacity)
+            assert checked == normal and stats['min_remaining'] == capacity
+            try:
+                qr.generate('A', ['Z'], ecc, eci=False, min_rs_margin=capacity + 1)
+            except ValueError as error:
+                assert 'below required minimum' in str(error)
+            else:
+                raise AssertionError('Margin failure without replacement accepted')
+    # Model 2 allows at most fifteen correctable codewords per block.
+    assert qr.generate('A', ['Z'], 'H', 40, eci=False, min_rs_margin=15)[1] == 40
+    for invalid in [-1, 16, 2**32, 1.5, '2', None, True]:
+        try:
+            qr.generate('A', ['Z'], min_rs_margin=invalid)
+        except ValueError as error:
+            assert 'Minimum RS margin' in str(error)
+        else:
+            raise AssertionError(f'Invalid margin accepted: {invalid!r}')
+    print('PASS minimum RS margin: independent boundaries, individual blocks, no replacement, and input validation')
     # Previously failed because an odd length difference shifted final padding.
     check_replacement(bytes(227), bytes(228), [b'Z'], 'L', eci=False)
     scattered = bytearray(40)
@@ -234,7 +279,10 @@ with tempfile.TemporaryDirectory() as temp:
         assert base64.b64decode(decoded[0]) == expected
     for options in [['--ecc-text', ''], ['--ecc-hex', ''], ['--ecc-hex', 'GG'],
                     ['--ecc-text', 'X', '--ecc-hex', '58'], ['--ecc-text-file', str(directory/'missing')],
-                    ['--ecc-text', 'B' * 2954], ['--ecc-text', 'B' * 2952], ['--ecc-text', 'B' * 8]]:
+                    ['--ecc-text', 'B' * 2954], ['--ecc-text', 'B' * 2952], ['--ecc-text', 'B' * 8],
+                    ['--ecc-text', 'BAAAAAAA', '--min-rs-margin', '3'],
+                    ['--min-rs-margin', '4'], ['--min-rs-margin', '-1'],
+                    ['--min-rs-margin', '16'], ['--min-rs-margin', '1.5']]:
         output = directory / 'rejected.png'
         command = [str(root/'qr-tail.py'), '--text', 'A' * 8, '--tail', 'Z', '--ecc', 'L', *options, '-o', str(output)]
         assert subprocess.run(command, capture_output=True).returncode == 2
@@ -244,3 +292,10 @@ with tempfile.TemporaryDirectory() as temp:
         assert output.read_bytes() == b'keep this file'
         output.unlink()
     print('PASS per-block overflow, replacement CLI options, invalid input, and output preservation')
+    for mode in ['byte', 'alphanumeric']:
+        output = directory / 'margin.png'
+        command = [str(root/'qr-tail.py'), '--text', 'A', '--tail', 'Z', '--ecc', 'L',
+                   '--no-eci', '--tail-mode', mode, '--min-rs-margin', '3', '-o', str(output), '--force']
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        assert 'Minimum remaining RS correction capacity: 3 codewords per block' in result.stdout
+    print('PASS minimum RS margin CLI in both tail modes')

@@ -23,6 +23,7 @@ def library():
         'QRinput_free': ([c.c_void_p], None),
         'QRcode_encodeMask': ([c.c_void_p, c.c_int], c.POINTER(QRcode)),
         'QRcode_encodeReplacement': ([c.c_void_p, c.c_void_p, c.c_int, c.POINTER(c.c_int)], c.POINTER(QRcode)),
+        'QRcode_encodeReplacementWithMargin': ([c.c_void_p, c.c_void_p, c.c_int, c.c_int, c.POINTER(c.c_int)], c.POINTER(QRcode)),
         'QRcode_free': ([c.POINTER(QRcode)], None),
     }
     for name, (args, result) in signatures.items():
@@ -32,7 +33,7 @@ def library():
 
 
 def generate(text, tails, ecc='M', version=0, mask=-1, eci=None, replacement=None, diagnostics=None,
-             *, tail_mode='byte'):
+             *, tail_mode='byte', min_rs_margin=0):
     if not tails or any(not item for item in [text, *tails]):
         raise ValueError('The visible data and each additional group must be nonempty.')
     items = [text, *tails]
@@ -42,6 +43,8 @@ def generate(text, tails, ecc='M', version=0, mask=-1, eci=None, replacement=Non
         raise ValueError('Invalid ECC level, version, or mask.')
     if tail_mode not in ('byte', 'alphanumeric'):
         raise ValueError('Invalid additional segment mode.')
+    if type(min_rs_margin) is not int or not 0 <= min_rs_margin <= 15:
+        raise ValueError('Minimum RS margin must be an integer in 0..15 codewords per block.')
     if eci is None:
         eci = all(isinstance(item, str) for item in items + ([] if replacement is None else [replacement]))
     payloads = [item.encode('utf-8') if isinstance(item, str) else bytes(item) for item in items]
@@ -82,17 +85,21 @@ def generate(text, tails, ecc='M', version=0, mask=-1, eci=None, replacement=Non
                 if lib.QRinput_append(handle, mode, len(data), buffer) < 0:
                     raise ValueError('Could not append data segment.')
         append_segments(inp, payloads)
-        if target is None:
+        if target is None and min_rs_margin == 0:
             code = lib.QRcode_encodeMask(inp, mask)
         else:
             target_inp = lib.QRinput_new2(version, 'LMQH'.index(ecc))
             if not target_inp:
                 raise ValueError('Could not allocate replacement QR input.')
-            append_segments(target_inp, [target, *payloads[1:]])
+            append_segments(target_inp, [payloads[0] if target is None else target, *payloads[1:]])
             stats = (c.c_int * 4)()
-            code = lib.QRcode_encodeReplacement(inp, target_inp, mask, stats)
+            code = lib.QRcode_encodeReplacementWithMargin(inp, target_inp, mask, min_rs_margin, stats)
             if stats[0]:
-                raise ValueError(f'RS block {stats[0]}: {stats[1]} differing data codewords exceed correction limit {stats[2]}.')
+                if stats[1] > stats[2]:
+                    raise ValueError(f'RS block {stats[0]}: {stats[1]} differing data codewords exceed correction limit {stats[2]}.')
+                raise ValueError(f'RS block {stats[0]}: remaining correction capacity {stats[2] - stats[1]} '
+                                 f'is below required minimum {min_rs_margin} codewords '
+                                 f'({stats[1]} differing data codewords, correction limit {stats[2]}).')
             if code and diagnostics is not None:
                 diagnostics['min_remaining'] = stats[3]
         if not code:
@@ -180,6 +187,8 @@ def main():
                         help='Encoding mode for all additional groups, independent of the body (default: byte).')
     parser.add_argument('-o', '--output', required=True, type=Path, help='Output .png, .svg, or matrix .txt.')
     parser.add_argument('--ecc', choices=list('LMQH'), default='M')
+    parser.add_argument('--min-rs-margin', type=int, choices=range(16), default=0, metavar='0..15',
+                        help='Minimum remaining correction capacity in every RS block, in codewords (default: 0); no automatic version search.')
     parser.add_argument('--version', type=int, choices=range(0, 41), default=0, metavar='0..40', help='Minimum version; 0 selects automatically.')
     parser.add_argument('--mask', type=int, choices=range(-1, 8), default=-1, metavar='-1..7', help='-1 selects automatically.')
     parser.add_argument('--scale', type=int, default=8, help='Pixels per module (1..32).')
@@ -203,7 +212,7 @@ def main():
         diagnostics = {}
         rows, version, offsets = generate(text, tails, args.ecc, args.version, args.mask,
                                           False if args.no_eci else None, replacement, diagnostics,
-                                          tail_mode=args.tail_mode)
+                                          tail_mode=args.tail_mode, min_rs_margin=args.min_rs_margin)
         data = output_bytes(rows, args.output.suffix.lower(), args.scale, args.margin)
         with args.output.open('wb' if args.force else 'xb') as stream:
             stream.write(data)
@@ -216,6 +225,7 @@ def main():
                   ', '.join(map(str, diagnostics['tail_offsets'])))
             print(f'Post-terminator zero padding: original {diagnostics["padding_bits"]} bits, '
                   f'replacement {diagnostics["replacement_padding_bits"]} bits')
+        if replacement is not None or args.min_rs_margin:
             print(f'Minimum remaining RS correction capacity: {diagnostics["min_remaining"]} codewords per block')
     except (OSError, ValueError) as error:
         parser.exit(2, f'error: {error}\n')

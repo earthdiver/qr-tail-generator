@@ -20,6 +20,19 @@ Outputs: PNG, SVG, or a borderless 0/1 text matrix. Defaults: ECC M, automatic v
 
 Ordinary readers stop at the first terminator and show visible text only. Strict readers may reject the noncanonical suffix. Additional data is not encrypted; this is not SQRC. Validation uses independent ZXing decoding and raw data checks.
 
+## Minimum RS correction margin
+
+Re-run `./build.sh` after updating. `--min-rs-margin N` requires every RS block to retain at least N correctable codewords: `floor(ECC codewords / 2) - differing data codewords >= N`. A codeword is eight bits, not a character or image module. Values are 0..15, the maximum per-block correction capacity in QR Model 2; the default 0 preserves existing behavior, including acceptance of zero remaining capacity.
+
+```bash
+./qr-tail.py --text 'H3llo W0rld!' --ecc-text 'Hello World.' \
+  --tail 'HIDDEN' --ecc H --min-rs-margin 2 -o margin.png
+```
+
+If any block has insufficient margin, generation exits with code 2 and reports its number, remaining capacity, requested minimum, difference count, and correction limit. Differences exceeding the correction limit retain the existing overflow error. No output is created, and existing files remain untouched even with `--force`. This does not search for a larger version or change the ECC level to satisfy the margin.
+
+Without a replacement body, there are no deliberate errors, so the check applies to each block's full correction capacity. A positive setting also prints the minimum remaining capacity on success. This is separate from the image quiet zone option `--margin`, and does not guarantee readability under arbitrary scanning conditions. Python callers can use `generate(..., min_rs_margin=2)`.
+
 ## Additional segment modes
 
 Use `--tail-mode byte|alphanumeric` to select the mode for all additional groups. The default is `byte`. The body always remains in byte mode, independent of the tail mode.
@@ -67,7 +80,7 @@ Both streams are encoded at a shared version that fits both inputs. For each RS 
 
 `--version` remains a minimum. Capacity can increase the version, but the generator does not search larger versions or change ECC levels to satisfy the correction limit. Mask selection uses the combined original data and replacement parity.
 
-Reported terminator offsets refer to data **before correction**. The corrected first terminator offset is reported separately because it depends on the replacement body length. Additional segment offsets are shared before/after correction; the CLI reports these offsets and both post-terminator padding lengths in bits. The CLI also reports the minimum remaining correction capacity across blocks. Zero remaining capacity is accepted, but intentional differences consume correction capacity that would otherwise protect against scanning errors. Binary text display and readers that reject post-terminator data remain reader-dependent.
+Reported terminator offsets refer to data **before correction**. The corrected first terminator offset is reported separately because it depends on the replacement body length. Additional segment offsets are shared before/after correction; the CLI reports these offsets and both post-terminator padding lengths in bits. The CLI also reports the minimum remaining correction capacity across blocks. By default, zero remaining capacity is accepted, but intentional differences consume correction capacity that would otherwise protect against scanning errors. Binary text display and readers that reject post-terminator data remain reader-dependent.
 
 Custom post-terminator parsers must skip `0000` groups in four-bit steps until the next mode indicator (`0100` for byte or `0010` for alphanumeric), then decode its count field and payload. Zeros inside the payload must not be skipped. Ordinary scanners stop at the first terminator. Existing tools that expect an additional segment immediately after that terminator need padding support.
 
@@ -77,6 +90,7 @@ Requires a JDK and a ZXing core JAR (tested with 3.5.4):
 
 ```bash
 python3 tests/verify.py --zxing-jar /path/to/core-3.5.4.jar
+python3 tests/verify_tail_modes.py --zxing-jar /path/to/core-3.5.4.jar
 ```
 
 The checks decode generated PNGs with ZXing and inspect the RS-corrected data bytes, verifying visible text, exact terminator positions, additional groups, and final padding. Coverage includes all eight masks, all ECC levels, Japanese, multiple groups, versions above 9, NUL, preserved newlines, all 256 byte values, mixed text/HEX parts, and invalid HEX rejection.

@@ -12,9 +12,10 @@
 /* stats: failing block (1-based, 0 on success), differences, limit,
  * minimum remaining correction capacity across all blocks.
  * Both inputs must have the same level; versions are minimum versions.
+ * min_margin reserves correctable codewords in every block (0..15).
  */
-QRcode *QRcode_encodeReplacement(QRinput *input, QRinput *replacement,
-                               int mask, int stats[4])
+QRcode *QRcode_encodeReplacementWithMargin(QRinput *input, QRinput *replacement,
+                                         int mask, int min_margin, int stats[4])
 {
     QRRawCode *actual = NULL, *target = NULL;
     QRcode *result = NULL;
@@ -25,7 +26,7 @@ QRcode *QRcode_encodeReplacement(QRinput *input, QRinput *replacement,
     memset(stats, 0, 4 * sizeof(int));
     stats[3] = INT_MAX;
     if(input->mqr || replacement->mqr || input->level != replacement->level ||
-       mask < -1 || mask > 7) {
+       mask < -1 || mask > 7 || min_margin < 0 || min_margin > 15) {
         errno = EINVAL;
         return NULL;
     }
@@ -49,7 +50,7 @@ QRcode *QRcode_encodeReplacement(QRinput *input, QRinput *replacement,
             differences += actual->rsblock[i].data[j] != target->rsblock[i].data[j];
         }
         limit = actual->rsblock[i].eccLength / 2;
-        if(differences > limit) {
+        if(limit - differences < min_margin) {
             stats[0] = i + 1;
             stats[1] = differences;
             stats[2] = limit;
@@ -88,4 +89,11 @@ cleanup:
     QRraw_free(actual);
     QRraw_free(target);
     return result;
+}
+
+/* Preserve the original entry point for existing callers. */
+QRcode *QRcode_encodeReplacement(QRinput *input, QRinput *replacement,
+                               int mask, int stats[4])
+{
+    return QRcode_encodeReplacementWithMargin(input, replacement, mask, 0, stats);
 }
