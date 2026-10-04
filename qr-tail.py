@@ -32,9 +32,9 @@ def library():
     return lib
 
 
-def generate(text, tails, ecc='M', version=0, mask=-1, eci=None, replacement=None, diagnostics=None,
+def generate(text, tails=(), ecc='M', version=0, mask=-1, eci=None, replacement=None, diagnostics=None,
              *, tail_mode='byte', min_rs_margin=0):
-    if not tails or any(not item for item in [text, *tails]):
+    if any(not item for item in [text, *tails]):
         raise ValueError('The visible data and each additional group must be nonempty.')
     items = [text, *tails]
     if replacement is not None and not replacement:
@@ -50,7 +50,7 @@ def generate(text, tails, ecc='M', version=0, mask=-1, eci=None, replacement=Non
     payloads = [item.encode('utf-8') if isinstance(item, str) else bytes(item) for item in items]
     target = None if replacement is None else (replacement.encode('utf-8') if isinstance(replacement, str) else bytes(replacement))
     body_length = max(len(payloads[0]), len(target) if target is not None else 0)
-    padding_bits = (body_length - len(payloads[0])) * 8
+    padding_bits = (body_length - len(payloads[0])) * 8 if tails else 0
     alphanumeric = tail_mode == 'alphanumeric'
     if alphanumeric and any(byte not in b'0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:'
                             for payload in payloads[1:] for byte in payload):
@@ -117,7 +117,7 @@ def generate(text, tails, ecc='M', version=0, mask=-1, eci=None, replacement=Non
             position += 4 + 4 + tail_count_bits + tail_data_bits(len(payload))
         if target is not None and diagnostics is not None:
             diagnostics['padding_bits'] = padding_bits
-            diagnostics['replacement_padding_bits'] = (body_length - len(target)) * 8
+            diagnostics['replacement_padding_bits'] = (body_length - len(target)) * 8 if tails else 0
             diagnostics['replacement_terminator'] = (12 if eci else 0) + 4 + count_bits + len(target) * 8
             diagnostics['tail_offsets'] = [offset + 4 + (padding_bits if index == 0 else 0)
                                            for index, offset in enumerate(offsets)]
@@ -179,7 +179,7 @@ def main():
     replacement.add_argument('--ecc-hex', type=parse_hex, help='Use replacement HEX bytes to calculate ECC; scanners recover these bytes.')
     replacement.add_argument('--ecc-text', help='Use replacement UTF-8 text to calculate ECC; scanners recover this text.')
     replacement.add_argument('--ecc-text-file', type=Path, help='Read replacement UTF-8 text without trimming newlines.')
-    hidden = parser.add_mutually_exclusive_group(required=True)
+    hidden = parser.add_mutually_exclusive_group()
     hidden.add_argument('--tail-hex', type=parse_hex, action='append', help='Additional binary group as HEX; repeat for multiple terminators.')
     hidden.add_argument('--tail', action='append', help='Additional UTF-8 group; repeat for multiple terminators.')
     hidden.add_argument('--tail-file', type=Path, action='append', help='Read additional UTF-8 group from a file; repeat as needed.')
@@ -204,7 +204,7 @@ def main():
         def read(path):
             return path.read_bytes().decode('utf-8')
         text = args.hex if args.hex is not None else (args.text if args.text is not None else read(args.text_file))
-        tails = args.tail_hex if args.tail_hex is not None else (args.tail if args.tail is not None else [read(path) for path in args.tail_file])
+        tails = args.tail_hex if args.tail_hex is not None else (args.tail if args.tail is not None else [read(path) for path in (args.tail_file or [])])
         if len(tails) > 16:
             raise ValueError('At most 16 additional groups are supported.')
         replacement = args.ecc_hex if args.ecc_hex is not None else (args.ecc_text if args.ecc_text is not None else
@@ -217,14 +217,18 @@ def main():
         with args.output.open('wb' if args.force else 'xb') as stream:
             stream.write(data)
         print(f'{args.output}: version {version}, ECC {args.ecc}, {len(rows)}x{len(rows)} modules')
-        print('Four-bit terminator starts (zero-based data bits): ' + ', '.join(map(str, offsets)))
+        if tails:
+            print('Four-bit terminator starts (zero-based data bits): ' + ', '.join(map(str, offsets)))
         if replacement is not None:
-            print('ECC replacement enabled; terminator offsets above describe data before RS correction.')
-            print(f'First terminator after RS correction: {diagnostics["replacement_terminator"]}')
-            print('Additional segment starts (shared before/after RS correction, zero-based data bits): ' +
-                  ', '.join(map(str, diagnostics['tail_offsets'])))
-            print(f'Post-terminator zero padding: original {diagnostics["padding_bits"]} bits, '
-                  f'replacement {diagnostics["replacement_padding_bits"]} bits')
+            if tails:
+                print('ECC replacement enabled; terminator offsets above describe data before RS correction.')
+                print(f'First terminator after RS correction: {diagnostics["replacement_terminator"]}')
+                print('Additional segment starts (shared before/after RS correction, zero-based data bits): ' +
+                      ', '.join(map(str, diagnostics['tail_offsets'])))
+                print(f'Post-terminator zero padding: original {diagnostics["padding_bits"]} bits, '
+                      f'replacement {diagnostics["replacement_padding_bits"]} bits')
+            else:
+                print('ECC replacement enabled.')
         if replacement is not None or args.min_rs_margin:
             print(f'Minimum remaining RS correction capacity: {diagnostics["min_remaining"]} codewords per block')
     except (OSError, ValueError) as error:

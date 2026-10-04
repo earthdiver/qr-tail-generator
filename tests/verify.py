@@ -21,6 +21,8 @@ with tempfile.TemporaryDirectory() as temp:
                     str(root / 'tests/InspectQr.java')], check=True)
     cases = [('VISIBLE', ['HIDDEN', 'SECOND'], 0, mask, False, 'LMQH'[mask % 4]) for mask in range(8)]
     cases += [('通常の本文', ['終端後の文字列', '別の追加文字列'], 0, -1, True, 'M'),
+              ('通常の本文', [], 0, -1, True, 'M'),
+              (bytes(range(10)).decode('latin1'), [], 10, 7, False, 'H'),
               ('VISIBLE\x00BODY', ['tail\x00text\nline'], 10, 0, True, 'Q'),
               ('LONG' * 150, ['tail' * 120], 27, 7, True, 'H')]
     for index, (text, tails, minimum, mask, eci, ecc) in enumerate(cases):
@@ -150,17 +152,19 @@ with tempfile.TemporaryDirectory() as temp:
         target_data, target_terms, target_tails = expected_stream(target_bytes)
         assert offsets == original_terms
         assert original_tails == target_tails == stats['tail_offsets']
-        assert stats['replacement_terminator'] == target_terms[0]
-        assert stats['padding_bits'] == (longest - len(body_bytes)) * 8
-        assert stats['replacement_padding_bits'] == (longest - len(target_bytes)) * 8
+        if tails:
+            assert stats['replacement_terminator'] == target_terms[0]
+        assert stats['padding_bits'] == ((longest - len(body_bytes)) * 8 if tails else 0)
+        assert stats['replacement_padding_bits'] == ((longest - len(target_bytes)) * 8 if tails else 0)
         assert mixed[0] == expected[0]  # Scanner text follows replacement.
         assert mixed[1] == target_data  # Corrected stream includes post-terminator padding.
         assert mixed[2] == original_data  # Physical data keeps original body and count.
         assert mixed[3] == mixed[4]  # Independent ZXing RS encoder verifies parity.
-        tail_start = original_tails[0]
-        original_bits = ''.join(f'{byte:08b}' for byte in mixed[2])
-        corrected_bits = ''.join(f'{byte:08b}' for byte in mixed[1])
-        assert original_bits[tail_start:] == corrected_bits[tail_start:]
+        if tails:
+            tail_start = original_tails[0]
+            original_bits = ''.join(f'{byte:08b}' for byte in mixed[2])
+            corrected_bits = ''.join(f'{byte:08b}' for byte in mixed[1])
+            assert original_bits[tail_start:] == corrected_bits[tail_start:]
         if body == target:
             assert rows == before[0]
         position = 0
@@ -186,10 +190,17 @@ with tempfile.TemporaryDirectory() as temp:
 
     for ecc in 'LMQH':
         for mask in range(8):
+            check_replacement('HELLO', 'HALLO', [], ecc, mask=mask)
             check_replacement('HELLO', 'HALLO', ['HIDDEN', 'SECOND'], ecc, mask=mask)
             check_replacement('ABC', 'ABCDE', ['TAIL' * 50, 'SECOND'], ecc, mask=mask)
             check_replacement('ABCDE', 'ABC', ['TAIL' * 50, 'SECOND'], ecc, mask=mask)
     for body, target, tails, ecc, version, eci in [
+        ('ABC', 'ABCDE', [], 'H', 0, None),
+        ('ABCDE', 'ABC', [], 'H', 0, None),
+        ('ABCDEFGH', 'ABCDEFGHI', [], 'H', 0, None),
+        ('ABCDEFGHI', 'ABCDEFGH', [], 'H', 0, None),
+        ('本文あ', '本文い', [], 'H', 10, None),
+        (b'A\x00\xff', b'B\x00\xfe', [], 'H', 0, None),
         ('HELLO', 'HALLO', ['HIDDEN'], 'M', 0, None),
         ('本文あ', '本文い', ['秘密', '次'], 'H', 10, None),
         (b'A\x00\xff', b'B\x00\xfe', [bytes(range(256))], 'Q', 27, None),
@@ -213,6 +224,40 @@ with tempfile.TemporaryDirectory() as temp:
     _, stats = check_replacement(bytes(8), bytes([0x10]) * 3 + bytes(5), [b'Z'], 'L', eci=False)
     assert stats['min_remaining'] == 0
     print('PASS replacement: all ECC/masks, UTF-8, binary, unequal lengths, shared version, and exact RS boundary')
+
+    # Optional tails work through all CLI body/replacement input forms.
+    body_file, target_file = directory/'body.txt', directory/'replacement.txt'
+    body_file.write_bytes(b'ABCDEFGH\n')
+    target_file.write_bytes(b'ABCDEFGI\n')
+    for index, (options, expected) in enumerate([
+        (['--text', 'BODY'], b'BODY'),
+        (['--hex', '0041FF'], b'\x00A\xff'),
+        (['--text-file', str(body_file)], b'ABCDEFGH\n'),
+        (['--text', 'ABC', '--ecc-text', 'ABCDE'], b'ABCDE'),
+        (['--text', 'ABCDE', '--ecc-text', 'ABC'], b'ABC'),
+        (['--hex', '4100FF', '--ecc-hex', '4200FE'], b'B\x00\xfe'),
+        (['--text-file', str(body_file), '--ecc-text-file', str(target_file)], b'ABCDEFGI\n'),
+    ]):
+        output = directory/f'no-tail-{index}.png'
+        report = subprocess.run([str(root/'qr-tail.py'), *options, '--ecc', 'H',
+                                 '--min-rs-margin', '1', '-o', str(output)],
+                                check=True, capture_output=True, text=True).stdout
+        assert 'terminator' not in report and 'Additional segment starts' not in report
+        version = (int.from_bytes(output.read_bytes()[16:20], 'big') // 8 - 8 - 17) // 4
+        decoded, _ = inspect(qr.generate(
+            expected, ecc='H', version=version, eci=not ('--hex' in options))[0])
+        lines = subprocess.run(['java', '-cp', f'{temp}:{jar}', 'VerifyQr', str(output), '8', '4'],
+                               check=True, capture_output=True, text=True).stdout.splitlines()
+        assert base64.b64decode(lines[1]) == decoded[1], (index, options)
+    assert qr.generate('BODY') == qr.generate('BODY', [])
+    for body, tails in [('', []), ('BODY', [''])]:
+        try:
+            qr.generate(body, tails)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Empty payload accepted')
+    print('PASS optional tails: CLI text/files/HEX, replacement, standard padding, and margin')
 
     def rejected(body, target, tails, ecc, version, block, changes, limit):
         try:

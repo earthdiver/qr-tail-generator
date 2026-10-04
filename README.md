@@ -4,12 +4,15 @@ A standalone Linux/WSL CLI. It uses Kentaro Fukuchi's libqrencode `invalid_null`
 
 See [the Japanese guide](README.ja.md) for detailed usage.
 
+`--tail`, `--tail-file`, and `--tail-hex` are optional. Without additional groups, only the body is encoded with the usual terminator and padding.
+
 ## Run
 
 `qr-tail.py` requires Python 3, Git, and a C compiler (`cc`). Only initial library retrieval needs network access. Generation is offline and requires no third-party Python packages or system installation.
 
 ```bash
 ./build.sh
+./qr-tail.py --text 'VISIBLE' -o body-only.png
 ./qr-tail.py --text 'VISIBLE' --tail 'HIDDEN' -o sample.png
 ./qr-tail.py --text 'VISIBLE' --tail 'FIRST' --tail 'SECOND' -o multiple.svg
 ./qr-tail.py --text-file body.txt --tail-file extra.txt -o matrix.txt
@@ -77,6 +80,14 @@ Choose at most one of `--ecc-text`, `--ecc-text-file`, and `--ecc-hex`. These op
 Replacement data must be nonempty. Different body lengths are allowed; UTF-8 files preserve newlines and NUL. Lengths are compared in bytes after UTF-8 encoding. After the shorter body's first four-bit terminator, two extra `0000` groups are added per byte of difference. The first additional segment starts immediately after the longer body's terminator in both streams; subsequent groups and final padding also stay aligned. Padding is outside the body count and adds no NUL characters to the decoded body. This also applies to HEX input. `--ecc-hex` also triggers the existing rule that any HEX input disables automatic UTF-8 ECI for the whole symbol.
 
 Both streams are encoded at a shared version that fits both inputs. For each RS block, the number of differing 8-bit data codewords must be at most half its ECC codeword count, rounded down. Differences include count headers, terminators, additional groups, and padding, not just changed characters. Exceeding any block's limit reports the block number, differences, and limit, exits with code 2, and leaves output files untouched even with `--force`.
+
+Alignment padding applies only when additional groups are present. Replacement ECC also works without `--tail*`: each body uses its usual terminator and final padding, with no zeros added to compensate for unequal body lengths. Terminator and additional-segment offsets are not printed in this case. Differences in final padding also consume RS correction capacity, so adding or omitting tails can change whether a replacement fits the correction limit.
+
+```bash
+./qr-tail.py --text 'ABC' --ecc-text 'ABCDE' --ecc H -o replacement-only.png
+```
+
+Python callers can omit tails (`generate('ABC', replacement='ABCDE', ecc='H')`) or pass an empty list.
 
 `--version` remains a minimum. Capacity can increase the version, but the generator does not search larger versions or change ECC levels to satisfy the correction limit. Mask selection uses the combined original data and replacement parity.
 
